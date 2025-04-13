@@ -13,3 +13,10 @@ go run main.go -method="embed" -in="./images/raw.bmp" -out="./images/embedded.bm
 go run main.go -method="extract" -in="./images/embedded.bmp" -seed="my secret seed"
 # output: my hidden message😊
 ```
+
+## Notes
+
+- This tool is intended for educational exploration of steganography.
+- LSB embedding, despite pseudo-random distribution, can create detectable statistical anomalies in images.
+- Detection reveals that a message might be concealed, even if the content remains unreadable.
+- Even if the seed is compromised, the exact encryption and PRNG algorithms are still required for successful message extraction
