@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -67,25 +68,46 @@ func startRandomizer(seed string, file []byte) func() uint64 {
 	}
 }
 
-func extract(filename string, seed string, salt string) {
+func getImage(filename string) (image []byte, err error) {
 	if !strings.HasSuffix(filename, ".bmp") {
-		log.Fatal("Only bmp files are supported", filename)
+		return nil, errors.New("Only bmp files are supported")
 	}
 	file, err := os.ReadFile(filename)
 
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+	if len(file) <= BMP_HEADER_SIZE {
+		return nil, errors.New("File is too small to be a valid BMP with data.")
+	}
+
+	return file, nil
+}
+
+func extract(filename string, seed string, salt string) {
+	file, err := getImage(filename)
+
+	if err != nil {
+		log.Fatalf("Could not get image %w", err)
 	}
 
 	getNextPosition := startRandomizer(seed, file)
 
 	byteBuffer := ""
 	var messageBytes []byte
+	extractedBits := 0
+	maxBitsToExtract := len(file) * 8 // Absolute theoretical maximum
 
 	for {
+		// Prevent infinite loop if END marker is not found
+		if extractedBits > maxBitsToExtract {
+			log.Fatal("Extraction limit reached without finding END marker. Seed/Salt likely incorrect or file corrupted.")
+		}
+
 		position := getNextPosition()
 		binaryStr := byteToBinaryString(file[position])
 		byteBuffer += binaryStr[len(binaryStr)-1:]
+		extractedBits++
 
 		if len(byteBuffer) == 8 {
 			charByte := binaryStringToByte(byteBuffer)
@@ -94,9 +116,9 @@ func extract(filename string, seed string, salt string) {
 
 			messageStr := string(messageBytes)
 			if len(messageStr) == len(START) && messageStr != START {
-				log.Fatal("Start of the message does not match. Seed likely incorrect.")
+				log.Fatal("Start of the message does not match. Seed/Salt likely incorrect.")
 			}
-			if strings.Contains(messageStr, END) {
+			if strings.HasSuffix(messageStr, END) {
 				break
 			}
 		}
@@ -117,13 +139,13 @@ func deriveKeyAndIV(seed string, salt []byte, keyLength int, ivLength int) (key 
 	key = make([]byte, keyLength)
 	_, err = io.ReadFull(hkdfReader, key)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to derive key: %w", err)
 	}
 
 	iv = make([]byte, ivLength)
 	_, err = io.ReadFull(hkdfReader, iv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to derive IV: %w", err)
 	}
 
 	return key, iv, nil
@@ -146,8 +168,14 @@ func createAesCipher(fileData []byte, seed string, salt string) *dongle.Cipher {
 	var saltBytes []byte
 	if salt == "" {
 		saltBytes = generateSalt(fileData, seed)
+		fmt.Println("Generated salt from seed and image header.")
 	} else {
 		saltBytes = []byte(salt)
+		fmt.Println("Using provided salt.")
+	}
+
+	if len(saltBytes) < 16 {
+		log.Fatal("Generated or provided salt is too short.")
 	}
 
 	// divide by half due to hex encoding later
@@ -156,60 +184,66 @@ func createAesCipher(fileData []byte, seed string, salt string) *dongle.Cipher {
 
 	key, iv, err := deriveKeyAndIV(seed, saltBytes, keyLength, ivLength)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to derive key/IV: %v", err)
 	}
+
 	cipher.SetKey(hex.EncodeToString(key))
 	cipher.SetIV(hex.EncodeToString(iv))
 	return cipher
 }
 
 func embed(inputFile string, outputFile string, secretMessage string, seed string, salt string) {
-	if !strings.HasSuffix(inputFile, ".bmp") {
-		log.Fatal("Only bmp files are supported")
-	}
-	file, err := os.ReadFile(inputFile)
+	file, err := getImage(inputFile)
 
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Could not get image %w", err)
 	}
 
 	cipher := createAesCipher(file, seed, salt)
 	encryptedMessage := dongle.Encrypt.FromString(secretMessage).ByAes(cipher).ToHexString()
 	messageBytes := []byte(START + encryptedMessage + END)
 
-	var builder strings.Builder
+	// Convert message bytes to a string of bits
+	var bitStringBuilder strings.Builder
+	bitStringBuilder.Grow(len(messageBytes) * 8)
 	for _, b := range messageBytes {
-		builder.WriteString(fmt.Sprintf("%08b", b))
+		bitStringBuilder.WriteString(fmt.Sprintf("%08b", b))
 	}
-	message := builder.String()
+	messageBits := bitStringBuilder.String()
+
+	availableBits := len(file) - BMP_HEADER_SIZE
+	if len(messageBits) > availableBits {
+		log.Fatalf("Message is too large to embed in this image. Message bits: %d, Available bits: %d", len(messageBits), availableBits)
+	}
 
 	getNextPosition := startRandomizer(seed, file)
-	for _, bit := range message {
+
+	fmt.Printf("Embedding %d bits...\n", len(messageBits))
+	for _, bit := range messageBits {
 		position := getNextPosition()
 		binaryStr := byteToBinaryString(file[position])
 		newBits := binaryStr[:len(binaryStr)-1] + string(bit)
 		file[position] = binaryStringToByte(newBits)
 	}
-	if err := os.WriteFile(outputFile, file, 0666); err != nil {
+	if err := os.WriteFile(outputFile, file, 0644); err != nil {
 		log.Fatal(err)
 	}
+	fmt.Printf("Successfully embedded message into %s\n", outputFile)
 }
 
 func main() {
-	method := flag.String("method", "", "Method to run: embed or extract")
-	seed := flag.String("seed", "", "PRNG seed")
-	salt := flag.String("salt", "", "Optional salt to use for the encryption. Otherwise created automatically based on the seed and image header data.")
-	inputFile := flag.String("in", "", "Input BMP file to write message into")
-	outputFile := flag.String("out", "", "Output BMP file with hidden message")
-	message := flag.String("message", "", "Message to hide")
+	method := flag.String("method", "", "Method: embed, extract")
+	seed := flag.String("seed", "", "Seed for PRNG and key derivation (required for embed/extract)")
+	salt := flag.String("salt", "", "[Optional] Salt for key derivation (if not provided, generated from seed+header)")
+	inputFile := flag.String("in", "", "Input file (BMP for embed/extract)")
+	outputFile := flag.String("out", "", "[Embed] Output BMP file")
+	message := flag.String("message", "", "[Embed] Secret message to hide")
 
 	flag.Parse()
 
-	fmt.Println("Start", *method)
 	if *method == "extract" {
 		extract(*inputFile, *seed, *salt)
 	} else if *method == "embed" {
 		embed(*inputFile, *outputFile, *message, *seed, *salt)
 	}
-	fmt.Println("Finished", *method)
 }
